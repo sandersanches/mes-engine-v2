@@ -14,28 +14,58 @@ interface WorkCenterRecord {
   status: 'STOPPED' | 'PRODUCTION' | 'NO_PROGRAM' | 'PLANNED_STOP';
   productionDeviceId: string | null;
   productionChannel: string | null;
+  rejectDeviceId: string | null;
+  rejectChannel: string | null;
+  isRejectEnabled: boolean;
   simulatedProductionDeviceId: string | null;
   simulatedProductionChannel: string | null;
+  simulatedRejectDeviceId: string | null;
+  simulatedRejectChannel: string | null;
   isSimulatedProduction: boolean;
+  isSimulatedReject: boolean;
+  isSimulatedRejectEnabled: boolean;
   counterState: { value: bigint; timestamp: Date } | null;
   processedState: { lastProcessed: Date | null } | null;
+  metricState: {
+    lastMetricId: string;
+    productionMetrics: {
+      id: string;
+      hour: Date;
+      initialTime: Date;
+      finalTime: Date;
+      shiftId: string | null;
+      orderId: string | null;
+      filterOrder: string;
+      initialProductionCount: bigint;
+      finalProductionCount: bigint;
+      initialRejectCount: bigint;
+      finalRejectCount: bigint;
+      producedQuantity: bigint;
+      autoRejectedQuantity: bigint;
+      manualRejectedQuantity: number;
+      totalRejectedQuantity: bigint;
+    } | null;
+  } | null;
   downtimeState: {
     downtimeId: string;
     intervalDowntimeId: string;
     startTime: Date;
-    productionMetricsId: string;
+    productionMetricsId: string | null;
+    orderId: string | null;
   } | null;
   orders: Array<{
     id: string;
     status: string;
     producedQuantity: bigint;
+    autoRejectedQuantity: bigint;
     initialProductionCount: bigint;
     finalProductionCount: bigint;
+    initialRejectCount: bigint;
+    finalRejectCount: bigint;
     counterStarted: boolean;
   }>;
 }
 
-// Obtém a data arredondada para o início da hora cheia (ex: 14:00:00.000)
 function getHourBucket(date: Date): Date {
   const d = new Date(date);
   d.setMinutes(0, 0, 0);
@@ -49,12 +79,16 @@ export async function processTenantWorkCenters(
   const tenantDb = await getTenantClient<any>(tenant.subdomain);
   const shifts = await getTenantShifts(tenant.subdomain);
 
-  // 1. Carrega os centros com seus estados e a OP ativa (se houver)
   const workCenters: WorkCenterRecord[] = await tenantDb.workCenter.findMany({
     where: { deletedAt: null },
     include: {
       counterState: true,
       processedState: true,
+      metricState: {
+        include: {
+          productionMetrics: true,
+        },
+      },
       downtimeState: true,
       orders: {
         where: { status: 'RUNNING', deletedAt: null },
@@ -64,33 +98,41 @@ export async function processTenantWorkCenters(
   });
 
   for (const wc of workCenters) {
-    // Define qual dispositivo e canal ler (Simulador ou Hardware Real)
-    const effectiveDeviceId = wc.isSimulatedProduction
+    const isSimulated = wc.isSimulatedProduction;
+    const prodDeviceId = isSimulated
       ? wc.simulatedProductionDeviceId || 'SIMULADOR-IOT-001'
       : wc.productionDeviceId;
-
-    const effectiveChannel = wc.isSimulatedProduction
+    const prodChannel = isSimulated
       ? wc.simulatedProductionChannel || 'chd1_value'
       : wc.productionChannel || 'chd1_value';
 
-    if (!effectiveDeviceId) continue;
+    const isRejectActive = isSimulated
+      ? wc.isSimulatedReject && wc.isSimulatedRejectEnabled
+      : wc.isRejectEnabled;
+    const rejChannel = isSimulated
+      ? wc.simulatedRejectChannel || 'chd2_value'
+      : wc.rejectChannel || 'chd2_value';
 
-    // Timestamp do último ponto processado
+    if (!prodDeviceId) continue;
+
+    const channelsToQuery = [prodChannel];
+    if (isRejectActive && rejChannel && rejChannel !== prodChannel) {
+      channelsToQuery.push(rejChannel);
+    }
+
     let lastProcessedTimestampSeconds = 0;
     if (wc.processedState?.lastProcessed) {
       lastProcessedTimestampSeconds = Math.floor(
         new Date(wc.processedState.lastProcessed).getTime() / 1000,
       );
     } else {
-      // Padrão: últimas 2 horas caso seja a primeira execução
       lastProcessedTimestampSeconds = Math.floor(Date.now() / 1000) - 2 * 3600;
     }
 
-    // 2. Busca fatias cronológicas paginadas no InfluxDB
     const points: TelemetryFeedPoint[] = await fetchPointsAfterDirect({
       bucket: tenant.influxBucket,
-      deviceId: effectiveDeviceId,
-      channel: effectiveChannel,
+      deviceId: prodDeviceId,
+      channels: channelsToQuery,
       afterTimestampSeconds: lastProcessedTimestampSeconds,
       limit: batchLimit,
     });
@@ -98,27 +140,39 @@ export async function processTenantWorkCenters(
     if (points.length === 0) continue;
 
     logger.debug(
-      `⚙️ [MES Engine] Processando ${points.length} ponto(s) para linha "${wc.name}" (${tenant.subdomain}).`,
+      `⚙️ [MES Engine] Processando ${points.length} ponto(s) para "${wc.name}" (${tenant.subdomain}).`,
     );
 
     // =========================================================================
-    // 3. EXECUÇÃO DA MÁQUINA DE ESTADOS EM MEMÓRIA
+    // RECUPERA ESTADOS ANTERIORES
     // =========================================================================
-    let currentCounter = wc.counterState ? wc.counterState.value : 0n;
+    let currentProdCounter = wc.counterState ? wc.counterState.value : 0n;
+    let currentRejectCounter = 0n;
     let lastPulseTime = wc.counterState
       ? wc.counterState.timestamp
       : new Date(points[0].timestampMs);
     let latestProcessedPointTimestampMs = 0;
 
-    let activeOrder = wc.orders.length > 0 ? wc.orders[0] : null;
-    let workCenterStatus = wc.status;
+    const activeOrder = wc.orders.length > 0 ? wc.orders[0] : null;
+    let workCenterStatus = activeOrder ? wc.status : 'NO_PROGRAM';
 
-    // Estado da parada em andamento
+    // Estados de Downtime
     let activeDowntimeId = wc.downtimeState?.downtimeId || null;
     let activeIntervalDowntimeId = wc.downtimeState?.intervalDowntimeId || null;
     let downtimeStartTime = wc.downtimeState
       ? wc.downtimeState.startTime
       : null;
+
+    let intervalStartTime: Date | null = null;
+    if (activeIntervalDowntimeId) {
+      const existingInterval = await tenantDb.intervalDowntime.findUnique({
+        where: { id: activeIntervalDowntimeId },
+      });
+      if (existingInterval) {
+        intervalStartTime = existingInterval.startTime;
+      }
+    }
+
     let currentShiftForDowntime: CachedShift | null = null;
     let currentHourForInterval: Date | null = null;
 
@@ -127,79 +181,144 @@ export async function processTenantWorkCenters(
         shifts,
         downtimeStartTime.getTime(),
       );
-      currentHourForInterval = getHourBucket(downtimeStartTime);
+      currentHourForInterval = getHourBucket(
+        intervalStartTime || downtimeStartTime,
+      );
     }
 
-    // Mapa agregador de métricas para persistência em lote ao final:
-    // Chave composta: hourIso_shiftId_orderId
-    const metricAccumulator = new Map<
+    const downtimesToCreate: any[] = [];
+    const downtimesToUpdate = new Map<
       string,
-      {
-        hour: Date;
-        shiftId: string | null;
-        orderId: string | null;
-        filterOrder: string;
-        producedQuantity: bigint;
-        initialCount: bigint;
-        finalCount: bigint;
-      }
+      { endTime: Date; durationSeconds: bigint }
     >();
 
-    // Operações de banco coletadas para a transação final
-    const downtimesToCreate: any[] = [];
-    const downtimesToUpdate: Array<{
-      id: string;
-      endTime: Date;
-      durationSeconds: bigint;
-    }> = [];
-
     const intervalsToCreate: any[] = [];
-    const intervalsToUpdate: Array<{
-      id: string;
-      endTime: Date;
-      durationSeconds: bigint;
-    }> = [];
+    const intervalsToUpdate = new Map<
+      string,
+      { endTime: Date; durationSeconds: bigint }
+    >();
 
-    for (const point of points) {
-      const pointTime = new Date(point.timestampMs);
-      const pointValueBigInt = BigInt(Math.max(0, Math.floor(point.value)));
-      latestProcessedPointTimestampMs = point.timestampMs;
+    // =========================================================================
+    // INICIALIZAÇÃO DA MÉTRICA ATIVA VIA METRIC_STATE
+    // =========================================================================
+    interface ActiveMetricMemory {
+      id: string | null; // Se nulo, precisa ser criada no banco
+      hour: Date;
+      initialTime: Date;
+      finalTime: Date;
+      shiftId: string | null;
+      orderId: string | null;
+      filterOrder: string;
+      initialProdCount: bigint;
+      finalProdCount: bigint;
+      initialRejCount: bigint;
+      finalRejCount: bigint;
+      producedQuantity: bigint;
+      autoRejectedQuantity: bigint;
+      manualRejectedQuantity: number;
+      totalRejectedQuantity: bigint;
+      isClosed: boolean; // Indica se foi encerrada e não aceita novos pontos
+    }
 
-      // Cálculo do delta
-      let delta = 0n;
-      if (pointValueBigInt >= currentCounter) {
-        delta = pointValueBigInt - currentCounter;
-      } else {
-        // Reset de hardware ou overflow
-        delta = pointValueBigInt;
+    let currentActiveMetric: ActiveMetricMemory | null = null;
+
+    if (wc.metricState && wc.metricState.productionMetrics) {
+      const pm = wc.metricState.productionMetrics;
+      currentActiveMetric = {
+        id: pm.id,
+        hour: new Date(pm.hour),
+        initialTime: new Date(pm.initialTime),
+        finalTime: new Date(pm.finalTime),
+        shiftId: pm.shiftId,
+        orderId: pm.orderId,
+        filterOrder: pm.filterOrder,
+        initialProdCount: BigInt(pm.initialProductionCount ?? 0n),
+        finalProdCount: BigInt(pm.finalProductionCount ?? 0n),
+        initialRejCount: BigInt(pm.initialRejectCount ?? 0n),
+        finalRejCount: BigInt(pm.finalRejectCount ?? 0n),
+        producedQuantity: BigInt(pm.producedQuantity ?? 0n),
+        autoRejectedQuantity: BigInt(pm.autoRejectedQuantity ?? 0n),
+        manualRejectedQuantity: pm.manualRejectedQuantity ?? 0,
+        totalRejectedQuantity: BigInt(pm.totalRejectedQuantity ?? 0n),
+        isClosed: false,
+      };
+    }
+
+    // Lista de métricas que foram finalizadas/congeladas durante este lote
+    const closedMetricsToPersist: ActiveMetricMemory[] = [];
+
+    // Agrupa e ordena pontos cronologicamente
+    const timestampMap = new Map<number, { prod?: number; rej?: number }>();
+    for (const p of points) {
+      if (!timestampMap.has(p.timestampMs)) {
+        timestampMap.set(p.timestampMs, {});
+      }
+      const entry = timestampMap.get(p.timestampMs)!;
+      if (p.channel === prodChannel) entry.prod = p.value;
+      if (p.channel === rejChannel) entry.rej = p.value;
+    }
+
+    const sortedTimestamps = Array.from(timestampMap.keys()).sort(
+      (a, b) => a - b,
+    );
+
+    for (const ts of sortedTimestamps) {
+      const pointTime = new Date(ts);
+      latestProcessedPointTimestampMs = ts;
+      const data = timestampMap.get(ts)!;
+
+      let prodDelta = 0n;
+      if (data.prod !== undefined) {
+        const prodVal = BigInt(Math.max(0, Math.floor(data.prod)));
+        if (prodVal >= currentProdCounter) {
+          prodDelta = prodVal - currentProdCounter;
+        } else {
+          prodDelta = prodVal;
+        }
+        currentProdCounter = prodVal;
       }
 
-      currentCounter = pointValueBigInt;
-      const currentShift = resolveShiftForTimestamp(shifts, point.timestampMs);
+      if (data.rej !== undefined) {
+        currentRejectCounter = BigInt(Math.max(0, Math.floor(data.rej)));
+      }
+
+      const currentShift = resolveShiftForTimestamp(shifts, ts);
       const currentHour = getHourBucket(pointTime);
 
-      // -------------------------------------------------------------
-      // REGRA A: Linha com Ordem de Produção (`RUNNING`)
-      // -------------------------------------------------------------
+      // =======================================================================
+      // CASO 1: COM ORDEM DE PRODUÇÃO ATIVA (`RUNNING`)
+      // =======================================================================
       if (activeOrder) {
-        if (delta > 0n) {
-          // Houve avanço de peças: máquina produzindo
+        if (prodDelta > 0n) {
           lastPulseTime = pointTime;
           workCenterStatus = 'PRODUCTION';
-          activeOrder.producedQuantity += delta;
-          activeOrder.finalProductionCount = currentCounter;
+
+          activeOrder.finalProductionCount = currentProdCounter;
+          activeOrder.finalRejectCount = currentRejectCounter;
           if (!activeOrder.counterStarted) {
             activeOrder.counterStarted = true;
-            activeOrder.initialProductionCount = currentCounter;
+            activeOrder.initialProductionCount = currentProdCounter;
+            activeOrder.initialRejectCount = currentRejectCounter;
           }
+          activeOrder.producedQuantity =
+            activeOrder.finalProductionCount >=
+            activeOrder.initialProductionCount
+              ? activeOrder.finalProductionCount -
+                activeOrder.initialProductionCount
+              : activeOrder.finalProductionCount;
 
-          // Se a linha estava parada, encerra a parada imediatamente
+          activeOrder.autoRejectedQuantity =
+            activeOrder.finalRejectCount >= activeOrder.initialRejectCount
+              ? activeOrder.finalRejectCount - activeOrder.initialRejectCount
+              : activeOrder.finalRejectCount;
+
           if (
             activeDowntimeId &&
             activeIntervalDowntimeId &&
-            downtimeStartTime
+            downtimeStartTime &&
+            intervalStartTime
           ) {
-            const durationSec = BigInt(
+            const dtDur = BigInt(
               Math.max(
                 0,
                 Math.floor(
@@ -207,42 +326,56 @@ export async function processTenantWorkCenters(
                 ),
               ),
             );
-            downtimesToUpdate.push({
-              id: activeDowntimeId,
+            const idtDur = BigInt(
+              Math.max(
+                0,
+                Math.floor(
+                  (pointTime.getTime() - intervalStartTime.getTime()) / 1000,
+                ),
+              ),
+            );
+
+            downtimesToUpdate.set(activeDowntimeId, {
               endTime: pointTime,
-              durationSeconds: durationSec,
+              durationSeconds: dtDur,
             });
-            intervalsToUpdate.push({
-              id: activeIntervalDowntimeId,
+            intervalsToUpdate.set(activeIntervalDowntimeId, {
               endTime: pointTime,
-              durationSeconds: durationSec,
+              durationSeconds: idtDur,
             });
 
             activeDowntimeId = null;
             activeIntervalDowntimeId = null;
             downtimeStartTime = null;
+            intervalStartTime = null;
           }
         } else {
-          // Delta == 0: sem avanço
-          const secondsSinceLastPulse = Math.floor(
+          const secondsSincePulse = Math.floor(
             (pointTime.getTime() - lastPulseTime.getTime()) / 1000,
           );
 
-          if (secondsSinceLastPulse >= tenant.stopToleranceSeconds) {
-            // Estourou a tolerância: linha entra em parada (STOPPED)
+          if (secondsSincePulse >= tenant.stopToleranceSeconds) {
             workCenterStatus = 'STOPPED';
 
             if (!activeDowntimeId) {
-              // Abre novo Downtime mestre e seu primeiro IntervalDowntime
               downtimeStartTime = lastPulseTime;
+              intervalStartTime = lastPulseTime;
               currentShiftForDowntime = currentShift;
               currentHourForInterval = currentHour;
 
               const newDowntimeId = `dt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
               const newIntervalId = `idt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
               activeDowntimeId = newDowntimeId;
               activeIntervalDowntimeId = newIntervalId;
+
+              const dur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - lastPulseTime.getTime()) / 1000,
+                  ),
+                ),
+              );
 
               downtimesToCreate.push({
                 id: newDowntimeId,
@@ -251,31 +384,26 @@ export async function processTenantWorkCenters(
                 shiftId: currentShift?.id || null,
                 startTime: downtimeStartTime,
                 endTime: pointTime,
-                durationSeconds: BigInt(secondsSinceLastPulse),
+                durationSeconds: dur,
               });
 
               intervalsToCreate.push({
                 id: newIntervalId,
                 downtimeId: newDowntimeId,
                 workCenterId: wc.id,
-                startTime: downtimeStartTime,
+                startTime: intervalStartTime,
                 endTime: pointTime,
-                durationSeconds: BigInt(secondsSinceLastPulse),
-                hour: currentHour,
+                durationSeconds: dur,
               });
             } else {
-              // Parada contínua:
-              // Verifica se houve troca de turno
               const shiftChanged =
                 currentShift?.id !== currentShiftForDowntime?.id;
-              // Verifica se virou a hora
               const hourChanged =
                 currentHour.getTime() !== currentHourForInterval?.getTime();
 
               if (shiftChanged) {
-                // Fecha a parada anterior na virada do turno e abre outra para o novo turno
-                if (downtimeStartTime) {
-                  const durationSec = BigInt(
+                if (downtimeStartTime && intervalStartTime) {
+                  const dtDur = BigInt(
                     Math.max(
                       0,
                       Math.floor(
@@ -284,20 +412,28 @@ export async function processTenantWorkCenters(
                       ),
                     ),
                   );
-                  downtimesToUpdate.push({
-                    id: activeDowntimeId,
+                  const idtDur = BigInt(
+                    Math.max(
+                      0,
+                      Math.floor(
+                        (pointTime.getTime() - intervalStartTime.getTime()) /
+                          1000,
+                      ),
+                    ),
+                  );
+
+                  downtimesToUpdate.set(activeDowntimeId, {
                     endTime: pointTime,
-                    durationSeconds: durationSec,
+                    durationSeconds: dtDur,
                   });
-                  intervalsToUpdate.push({
-                    id: activeIntervalDowntimeId!,
+                  intervalsToUpdate.set(activeIntervalDowntimeId!, {
                     endTime: pointTime,
-                    durationSeconds: durationSec,
+                    durationSeconds: idtDur,
                   });
                 }
 
-                // Inicia nova parada vinculada ao novo turno
                 downtimeStartTime = pointTime;
+                intervalStartTime = pointTime;
                 currentShiftForDowntime = currentShift;
                 currentHourForInterval = currentHour;
 
@@ -315,35 +451,35 @@ export async function processTenantWorkCenters(
                   endTime: pointTime,
                   durationSeconds: 0n,
                 });
+
                 intervalsToCreate.push({
                   id: newIntervalId,
                   downtimeId: newDowntimeId,
                   workCenterId: wc.id,
-                  startTime: downtimeStartTime,
+                  startTime: intervalStartTime,
                   endTime: pointTime,
                   durationSeconds: 0n,
-                  hour: currentHour,
                 });
               } else if (hourChanged) {
-                // Virou a hora: fecha apenas o IntervalDowntime anterior e abre outro no mesmo Downtime pai
-                if (downtimeStartTime) {
-                  const durSec = BigInt(
+                if (intervalStartTime) {
+                  const idtDur = BigInt(
                     Math.max(
                       0,
                       Math.floor(
-                        (pointTime.getTime() - downtimeStartTime.getTime()) /
+                        (pointTime.getTime() - intervalStartTime.getTime()) /
                           1000,
                       ),
                     ),
                   );
-                  intervalsToUpdate.push({
-                    id: activeIntervalDowntimeId!,
+                  intervalsToUpdate.set(activeIntervalDowntimeId!, {
                     endTime: pointTime,
-                    durationSeconds: durSec,
+                    durationSeconds: idtDur,
                   });
                 }
 
+                intervalStartTime = pointTime;
                 currentHourForInterval = currentHour;
+
                 const newIntervalId = `idt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 activeIntervalDowntimeId = newIntervalId;
 
@@ -351,15 +487,13 @@ export async function processTenantWorkCenters(
                   id: newIntervalId,
                   downtimeId: activeDowntimeId,
                   workCenterId: wc.id,
-                  startTime: pointTime,
+                  startTime: intervalStartTime,
                   endTime: pointTime,
                   durationSeconds: 0n,
-                  hour: currentHour,
                 });
-              } else {
-                // Apenas atualiza o endTime corrente e a duração em aberto
+
                 if (downtimeStartTime) {
-                  const totalDurSec = BigInt(
+                  const dtDur = BigInt(
                     Math.max(
                       0,
                       Math.floor(
@@ -368,15 +502,39 @@ export async function processTenantWorkCenters(
                       ),
                     ),
                   );
-                  downtimesToUpdate.push({
-                    id: activeDowntimeId,
+                  downtimesToUpdate.set(activeDowntimeId, {
                     endTime: pointTime,
-                    durationSeconds: totalDurSec,
+                    durationSeconds: dtDur,
                   });
-                  intervalsToUpdate.push({
-                    id: activeIntervalDowntimeId!,
+                }
+              } else {
+                if (downtimeStartTime && intervalStartTime) {
+                  const dtDur = BigInt(
+                    Math.max(
+                      0,
+                      Math.floor(
+                        (pointTime.getTime() - downtimeStartTime.getTime()) /
+                          1000,
+                      ),
+                    ),
+                  );
+                  const idtDur = BigInt(
+                    Math.max(
+                      0,
+                      Math.floor(
+                        (pointTime.getTime() - intervalStartTime.getTime()) /
+                          1000,
+                      ),
+                    ),
+                  );
+
+                  downtimesToUpdate.set(activeDowntimeId, {
                     endTime: pointTime,
-                    durationSeconds: totalDurSec,
+                    durationSeconds: dtDur,
+                  });
+                  intervalsToUpdate.set(activeIntervalDowntimeId!, {
+                    endTime: pointTime,
+                    durationSeconds: idtDur,
                   });
                 }
               }
@@ -384,213 +542,523 @@ export async function processTenantWorkCenters(
           }
         }
       } else {
-        // -------------------------------------------------------------
-        // REGRA B: Linha Sem Programação (`NO_PROGRAM`)
-        // -------------------------------------------------------------
+        // =======================================================================
+        // CASO 2: SEM ORDEM DE PRODUÇÃO (`NO_PROGRAM`)
+        // =======================================================================
         workCenterStatus = 'NO_PROGRAM';
-        // Mesmo com pulsos (delta > 0), a parada de "Sem Programação" não é finalizada.
-        // As peças continuam sendo computadas em métricas desvinculadas de OP.
+
+        if (!activeDowntimeId) {
+          downtimeStartTime = pointTime;
+          intervalStartTime = pointTime;
+          currentShiftForDowntime = currentShift;
+          currentHourForInterval = currentHour;
+
+          const newDowntimeId = `dt_np_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+          const newIntervalId = `idt_np_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+          activeDowntimeId = newDowntimeId;
+          activeIntervalDowntimeId = newIntervalId;
+
+          downtimesToCreate.push({
+            id: newDowntimeId,
+            workCenterId: wc.id,
+            orderId: null,
+            shiftId: currentShift?.id || null,
+            startTime: downtimeStartTime,
+            endTime: pointTime,
+            durationSeconds: 0n,
+            description: 'Linha sem programação de ordem de produção',
+          });
+
+          intervalsToCreate.push({
+            id: newIntervalId,
+            downtimeId: newDowntimeId,
+            workCenterId: wc.id,
+            startTime: intervalStartTime,
+            endTime: pointTime,
+            durationSeconds: 0n,
+          });
+        } else {
+          const shiftChanged = currentShift?.id !== currentShiftForDowntime?.id;
+          const hourChanged =
+            currentHour.getTime() !== currentHourForInterval?.getTime();
+
+          if (shiftChanged) {
+            if (downtimeStartTime && intervalStartTime) {
+              const dtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - downtimeStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+              const idtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - intervalStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+
+              downtimesToUpdate.set(activeDowntimeId, {
+                endTime: pointTime,
+                durationSeconds: dtDur,
+              });
+              intervalsToUpdate.set(activeIntervalDowntimeId!, {
+                endTime: pointTime,
+                durationSeconds: idtDur,
+              });
+            }
+
+            downtimeStartTime = pointTime;
+            intervalStartTime = pointTime;
+            currentShiftForDowntime = currentShift;
+            currentHourForInterval = currentHour;
+
+            const newDowntimeId = `dt_np_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+            const newIntervalId = `idt_np_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+            activeDowntimeId = newDowntimeId;
+            activeIntervalDowntimeId = newIntervalId;
+
+            downtimesToCreate.push({
+              id: newDowntimeId,
+              workCenterId: wc.id,
+              orderId: null,
+              shiftId: currentShift?.id || null,
+              startTime: downtimeStartTime,
+              endTime: pointTime,
+              durationSeconds: 0n,
+              description: 'Linha sem programação de ordem de produção',
+            });
+
+            intervalsToCreate.push({
+              id: newIntervalId,
+              downtimeId: newDowntimeId,
+              workCenterId: wc.id,
+              startTime: intervalStartTime,
+              endTime: pointTime,
+              durationSeconds: 0n,
+            });
+          } else if (hourChanged) {
+            if (intervalStartTime) {
+              const idtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - intervalStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+              intervalsToUpdate.set(activeIntervalDowntimeId!, {
+                endTime: pointTime,
+                durationSeconds: idtDur,
+              });
+            }
+
+            intervalStartTime = pointTime;
+            currentHourForInterval = currentHour;
+
+            const newIntervalId = `idt_np_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+            activeIntervalDowntimeId = newIntervalId;
+
+            intervalsToCreate.push({
+              id: newIntervalId,
+              downtimeId: activeDowntimeId,
+              workCenterId: wc.id,
+              startTime: intervalStartTime,
+              endTime: pointTime,
+              durationSeconds: 0n,
+            });
+
+            if (downtimeStartTime) {
+              const dtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - downtimeStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+              downtimesToUpdate.set(activeDowntimeId, {
+                endTime: pointTime,
+                durationSeconds: dtDur,
+              });
+            }
+          } else {
+            if (downtimeStartTime && intervalStartTime) {
+              const dtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - downtimeStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+              const idtDur = BigInt(
+                Math.max(
+                  0,
+                  Math.floor(
+                    (pointTime.getTime() - intervalStartTime.getTime()) / 1000,
+                  ),
+                ),
+              );
+
+              downtimesToUpdate.set(activeDowntimeId, {
+                endTime: pointTime,
+                durationSeconds: dtDur,
+              });
+              intervalsToUpdate.set(activeIntervalDowntimeId!, {
+                endTime: pointTime,
+                durationSeconds: idtDur,
+              });
+            }
+          }
+        }
       }
 
-      // -------------------------------------------------------------
-      // REGRA C: Agrupamento em ProductionMetrics
-      // -------------------------------------------------------------
-      const shiftKey = currentShift?.id || 'NO_SHIFT';
-      const orderKey = activeOrder?.id || 'NO_ORDER';
-      const hourKey = currentHour.toISOString();
-      const compKey = `${hourKey}_${shiftKey}_${orderKey}`;
+      // =======================================================================
+      // CONTROLE ESTRITO DA PRODUCTION METRICS USANDO METRIC_STATE
+      // =======================================================================
+      const targetShiftId = currentShift?.id || null;
+      const targetOrderId = activeOrder?.id || null;
+      const targetFilterOrder = `${wc.id}_${targetShiftId || 'NO_SHIFT'}_${targetOrderId || 'NO_ORDER'}`;
 
-      if (!metricAccumulator.has(compKey)) {
-        metricAccumulator.set(compKey, {
+      // Condição de Troca: hora virou, turno trocou ou OP mudou
+      const isShiftChanged =
+        currentActiveMetric && currentActiveMetric.shiftId !== targetShiftId;
+      const isHourChanged =
+        currentActiveMetric &&
+        currentActiveMetric.hour.getTime() !== currentHour.getTime();
+      const isOrderChanged =
+        currentActiveMetric && currentActiveMetric.orderId !== targetOrderId;
+
+      if (
+        currentActiveMetric &&
+        (isShiftChanged || isHourChanged || isOrderChanged)
+      ) {
+        // 1. FECHA a métrica anterior com os contadores e o timestamp exato do ponto da virada
+        currentActiveMetric.finalTime = pointTime;
+        currentActiveMetric.finalProdCount = currentProdCounter;
+        currentActiveMetric.finalRejCount = currentRejectCounter;
+        currentActiveMetric.producedQuantity =
+          currentActiveMetric.finalProdCount >=
+          currentActiveMetric.initialProdCount
+            ? currentActiveMetric.finalProdCount -
+              currentActiveMetric.initialProdCount
+            : currentActiveMetric.finalProdCount;
+        currentActiveMetric.autoRejectedQuantity =
+          currentActiveMetric.finalRejCount >=
+          currentActiveMetric.initialRejCount
+            ? currentActiveMetric.finalRejCount -
+              currentActiveMetric.initialRejCount
+            : currentActiveMetric.finalRejCount;
+        currentActiveMetric.totalRejectedQuantity =
+          currentActiveMetric.autoRejectedQuantity +
+          BigInt(currentActiveMetric.manualRejectedQuantity || 0);
+
+        currentActiveMetric.isClosed = true;
+        closedMetricsToPersist.push({ ...currentActiveMetric });
+
+        // 2. ABRE a nova métrica com contadores idênticos aos finais da anterior (producedQuantity = 0)
+        currentActiveMetric = {
+          id: null, // Será gerado na transação
           hour: currentHour,
-          shiftId: currentShift?.id || null,
-          orderId: activeOrder?.id || null,
-          filterOrder: `${wc.id}_${shiftKey}_${orderKey}`,
+          initialTime: pointTime,
+          finalTime: pointTime,
+          shiftId: targetShiftId,
+          orderId: targetOrderId,
+          filterOrder: targetFilterOrder,
+          initialProdCount: currentProdCounter,
+          finalProdCount: currentProdCounter,
+          initialRejCount: currentRejectCounter,
+          finalRejCount: currentRejectCounter,
           producedQuantity: 0n,
-          initialCount: pointValueBigInt,
-          finalCount: pointValueBigInt,
-        });
+          autoRejectedQuantity: 0n,
+          manualRejectedQuantity: 0,
+          totalRejectedQuantity: 0n,
+          isClosed: false,
+        };
+      } else if (!currentActiveMetric) {
+        // Primeira métrica do posto
+        currentActiveMetric = {
+          id: null,
+          hour: currentHour,
+          initialTime: pointTime,
+          finalTime: pointTime,
+          shiftId: targetShiftId,
+          orderId: targetOrderId,
+          filterOrder: targetFilterOrder,
+          initialProdCount: currentProdCounter,
+          finalProdCount: currentProdCounter,
+          initialRejCount: currentRejectCounter,
+          finalRejCount: currentRejectCounter,
+          producedQuantity: 0n,
+          autoRejectedQuantity: 0n,
+          manualRejectedQuantity: 0,
+          totalRejectedQuantity: 0n,
+          isClosed: false,
+        };
+      } else {
+        // Ponto dentro da mesma janela ativa: apenas atualiza o finalTime e contadores finais
+        currentActiveMetric.finalTime = pointTime;
+        currentActiveMetric.finalProdCount = currentProdCounter;
+        currentActiveMetric.finalRejCount = currentRejectCounter;
+        currentActiveMetric.producedQuantity =
+          currentActiveMetric.finalProdCount >=
+          currentActiveMetric.initialProdCount
+            ? currentActiveMetric.finalProdCount -
+              currentActiveMetric.initialProdCount
+            : currentActiveMetric.finalProdCount;
+        currentActiveMetric.autoRejectedQuantity =
+          currentActiveMetric.finalRejCount >=
+          currentActiveMetric.initialRejCount
+            ? currentActiveMetric.finalRejCount -
+              currentActiveMetric.initialRejCount
+            : currentActiveMetric.finalRejCount;
+        currentActiveMetric.totalRejectedQuantity =
+          currentActiveMetric.autoRejectedQuantity +
+          BigInt(currentActiveMetric.manualRejectedQuantity || 0);
       }
-
-      const m = metricAccumulator.get(compKey)!;
-      m.producedQuantity += delta;
-      m.finalCount = pointValueBigInt;
     }
 
     // =========================================================================
-    // 4. TRANSAÇÃO ATÔMICA FINAL NO POSTGRESQL (PERSISTÊNCIA EM LOTE)
+    // PERSISTÊNCIA ATÔMICA NO BANCO DO TENANT
     // =========================================================================
     await tenantDb.$transaction(async (tx: any) => {
-      // 4.1 Persistência de ProductionMetrics
-      for (const m of metricAccumulator.values()) {
-        const initialTime = new Date(m.hour);
-        const finalTime = new Date(m.hour.getTime() + 3600 * 1000);
-
-        // Busca se já existe métrica para essa janela
-        const existing = await tx.productionMetrics.findFirst({
-          where: {
-            hour: m.hour,
-            workCenterId: wc.id,
-            shiftId: m.shiftId,
-            filterOrder: m.filterOrder,
-          },
-        });
-
-        if (existing) {
+      // 1. Salva e congela definitivamente as métricas que foram encerradas durante este ciclo
+      for (const cm of closedMetricsToPersist) {
+        if (cm.id) {
           await tx.productionMetrics.update({
-            where: { id: existing.id },
+            where: { id: cm.id },
             data: {
-              producedQuantity: { increment: m.producedQuantity },
-              finalProductionCount: m.finalCount,
+              finalTime: cm.finalTime,
+              finalProductionCount: cm.finalProdCount,
+              producedQuantity: cm.producedQuantity,
+              finalRejectCount: cm.finalRejCount,
+              autoRejectedQuantity: cm.autoRejectedQuantity,
+              totalRejectedQuantity: cm.totalRejectedQuantity,
             },
           });
         } else {
-          await tx.productionMetrics.create({
+          // Caso tenha sido aberta e fechada dentro do mesmo lote
+          const created = await tx.productionMetrics.create({
             data: {
-              hour: m.hour,
-              initialTime,
-              finalTime,
+              hour: cm.hour,
+              initialTime: cm.initialTime,
+              finalTime: cm.finalTime,
               workCenterId: wc.id,
-              shiftId: m.shiftId,
-              orderId: m.orderId,
-              filterOrder: m.filterOrder,
-              producedQuantity: m.producedQuantity,
-              initialProductionCount: m.initialCount,
-              finalProductionCount: m.finalCount,
+              shiftId: cm.shiftId,
+              orderId: cm.orderId,
+              filterOrder: cm.filterOrder,
+              initialProductionCount: cm.initialProdCount,
+              finalProductionCount: cm.finalProdCount,
+              producedQuantity: cm.producedQuantity,
+              initialRejectCount: cm.initialRejCount,
+              finalRejectCount: cm.finalRejCount,
+              autoRejectedQuantity: cm.autoRejectedQuantity,
+              manualRejectedQuantity: cm.manualRejectedQuantity,
+              totalRejectedQuantity: cm.totalRejectedQuantity,
             },
           });
+          cm.id = created.id;
         }
       }
 
-      // 4.2 Criação e Atualização de Downtimes
-      for (const dt of downtimesToCreate) {
-        // Encontra uma métrica correspondente para vincular
-        const pm = await tx.productionMetrics.findFirst({
+      // 2. Salva a métrica que permanece ativa ao final do lote
+      let finalActiveMetricId: string | null = null;
+      if (currentActiveMetric) {
+        if (currentActiveMetric.id) {
+          await tx.productionMetrics.update({
+            where: { id: currentActiveMetric.id },
+            data: {
+              finalTime: currentActiveMetric.finalTime,
+              finalProductionCount: currentActiveMetric.finalProdCount,
+              producedQuantity: currentActiveMetric.producedQuantity,
+              finalRejectCount: currentActiveMetric.finalRejCount,
+              autoRejectedQuantity: currentActiveMetric.autoRejectedQuantity,
+              totalRejectedQuantity: currentActiveMetric.totalRejectedQuantity,
+            },
+          });
+          finalActiveMetricId = currentActiveMetric.id;
+        } else {
+          // Busca se já existe no banco por unicidade para não duplicar
+          const existing = await tx.productionMetrics.findFirst({
+            where: {
+              hour: currentActiveMetric.hour,
+              workCenterId: wc.id,
+              shiftId: currentActiveMetric.shiftId,
+              filterOrder: currentActiveMetric.filterOrder,
+            },
+          });
+
+          if (existing) {
+            await tx.productionMetrics.update({
+              where: { id: existing.id },
+              data: {
+                finalTime: currentActiveMetric.finalTime,
+                finalProductionCount: currentActiveMetric.finalProdCount,
+                producedQuantity: currentActiveMetric.producedQuantity,
+                finalRejectCount: currentActiveMetric.finalRejCount,
+                autoRejectedQuantity: currentActiveMetric.autoRejectedQuantity,
+                totalRejectedQuantity:
+                  currentActiveMetric.totalRejectedQuantity,
+              },
+            });
+            finalActiveMetricId = existing.id;
+          } else {
+            const created = await tx.productionMetrics.create({
+              data: {
+                hour: currentActiveMetric.hour,
+                initialTime: currentActiveMetric.initialTime,
+                finalTime: currentActiveMetric.finalTime,
+                workCenterId: wc.id,
+                shiftId: currentActiveMetric.shiftId,
+                orderId: currentActiveMetric.orderId,
+                filterOrder: currentActiveMetric.filterOrder,
+                initialProductionCount: currentActiveMetric.initialProdCount,
+                finalProductionCount: currentActiveMetric.finalProdCount,
+                producedQuantity: currentActiveMetric.producedQuantity,
+                initialRejectCount: currentActiveMetric.initialRejCount,
+                finalRejectCount: currentActiveMetric.finalRejCount,
+                autoRejectedQuantity: currentActiveMetric.autoRejectedQuantity,
+                manualRejectedQuantity:
+                  currentActiveMetric.manualRejectedQuantity,
+                totalRejectedQuantity:
+                  currentActiveMetric.totalRejectedQuantity,
+              },
+            });
+            finalActiveMetricId = created.id;
+          }
+        }
+      }
+
+      // 3. ATUALIZA O METRIC_STATE (Ponteiro da métrica ativa para o próximo ciclo ou reinício)
+      if (finalActiveMetricId) {
+        await tx.metricState.upsert({
           where: { workCenterId: wc.id },
-          orderBy: { hour: 'desc' },
-        });
-        if (pm) {
-          await tx.downtime.create({
-            data: {
-              id: dt.id,
-              workCenterId: dt.workCenterId,
-              orderId: dt.orderId,
-              shiftId: dt.shiftId,
-              startTime: dt.startTime,
-              endTime: dt.endTime,
-              durationSeconds: dt.durationSeconds,
-              productionMetricsId: pm.id,
-            },
-          });
-        }
-      }
-
-      for (const dtu of downtimesToUpdate) {
-        await tx.downtime.update({
-          where: { id: dtu.id },
-          data: { endTime: dtu.endTime, durationSeconds: dtu.durationSeconds },
+          update: { lastMetricId: finalActiveMetricId },
+          create: { workCenterId: wc.id, lastMetricId: finalActiveMetricId },
         });
       }
 
-      // 4.3 Criação e Atualização de IntervalDowntimes
-      for (const idt of intervalsToCreate) {
-        const pm = await tx.productionMetrics.findFirst({
-          where: { workCenterId: wc.id, hour: idt.hour },
-        });
-        if (pm) {
-          await tx.intervalDowntime.create({
-            data: {
-              id: idt.id,
-              downtimeId: idt.downtimeId,
-              workCenterId: idt.workCenterId,
-              startTime: idt.startTime,
-              endTime: idt.endTime,
-              durationSeconds: idt.durationSeconds,
-              productionMetricsId: pm.id,
-            },
-          });
-        }
-      }
-
-      for (const idtu of intervalsToUpdate) {
-        await tx.intervalDowntime.update({
-          where: { id: idtu.id },
+      // 4. Criação de Downtimes
+      for (const dt of downtimesToCreate) {
+        await tx.downtime.create({
           data: {
-            endTime: idtu.endTime,
-            durationSeconds: idtu.durationSeconds,
+            id: dt.id,
+            workCenterId: dt.workCenterId,
+            orderId: dt.orderId,
+            shiftId: dt.shiftId,
+            startTime: dt.startTime,
+            endTime: dt.endTime,
+            durationSeconds: dt.durationSeconds,
+            description: dt.description || null,
           },
         });
       }
 
-      // 4.4 Atualiza o status da linha fabril
+      // 5. Atualização de Downtimes em Aberto
+      for (const [id, data] of downtimesToUpdate.entries()) {
+        await tx.downtime.update({
+          where: { id },
+          data: {
+            endTime: data.endTime,
+            durationSeconds: data.durationSeconds,
+          },
+        });
+      }
+
+      // 6. Criação de IntervalDowntimes
+      for (const idt of intervalsToCreate) {
+        await tx.intervalDowntime.create({
+          data: {
+            id: idt.id,
+            downtimeId: idt.downtimeId,
+            workCenterId: idt.workCenterId,
+            startTime: idt.startTime,
+            endTime: idt.endTime,
+            durationSeconds: idt.durationSeconds,
+          },
+        });
+      }
+
+      // 7. Atualização de IntervalDowntimes em Aberto
+      for (const [id, data] of intervalsToUpdate.entries()) {
+        await tx.intervalDowntime.update({
+          where: { id },
+          data: {
+            endTime: data.endTime,
+            durationSeconds: data.durationSeconds,
+          },
+        });
+      }
+
+      // 8. Atualização de Status do Posto
       await tx.workCenter.update({
         where: { id: wc.id },
         data: { status: workCenterStatus },
       });
 
-      // 4.5 Se houver OP ativa, atualiza seus acumuladores
+      // 9. Atualização da Ordem Ativa (se houver)
       if (activeOrder) {
         await tx.order.update({
           where: { id: activeOrder.id },
           data: {
             producedQuantity: activeOrder.producedQuantity,
+            autoRejectedQuantity: activeOrder.autoRejectedQuantity,
+            initialProductionCount: activeOrder.initialProductionCount,
             finalProductionCount: activeOrder.finalProductionCount,
+            initialRejectCount: activeOrder.initialRejectCount,
+            finalRejectCount: activeOrder.finalRejectCount,
+            totalRejectedQuantity: activeOrder.autoRejectedQuantity,
             counterStarted: activeOrder.counterStarted,
           },
         });
       }
 
-      // 4.6 Atualiza CounterState (último valor absoluto)
+      // 10. Atualiza CounterState
       await tx.counterState.upsert({
         where: { workCenterId: wc.id },
-        update: {
-          value: currentCounter,
-          timestamp: lastPulseTime,
-        },
+        update: { value: currentProdCounter, timestamp: lastPulseTime },
         create: {
           workCenterId: wc.id,
-          value: currentCounter,
+          value: currentProdCounter,
           timestamp: lastPulseTime,
         },
       });
 
-      // 4.7 Atualiza DowntimeState com o ponteiro da parada aberta (ou limpa se retomou)
+      // 11. Atualiza DowntimeState
       if (activeDowntimeId && activeIntervalDowntimeId && downtimeStartTime) {
-        const pm = await tx.productionMetrics.findFirst({
+        await tx.downtimeState.upsert({
           where: { workCenterId: wc.id },
-          orderBy: { hour: 'desc' },
+          update: {
+            downtimeId: activeDowntimeId,
+            orderId: activeOrder ? activeOrder.id : null,
+            intervalDowntimeId: activeIntervalDowntimeId,
+            startTime: downtimeStartTime,
+            productionMetricsId: finalActiveMetricId,
+          },
+          create: {
+            workCenterId: wc.id,
+            downtimeId: activeDowntimeId,
+            orderId: activeOrder ? activeOrder.id : null,
+            intervalDowntimeId: activeIntervalDowntimeId,
+            startTime: downtimeStartTime,
+            productionMetricsId: finalActiveMetricId,
+          },
         });
-        if (pm) {
-          await tx.downtimeState.upsert({
-            where: { workCenterId: wc.id },
-            update: {
-              downtimeId: activeDowntimeId,
-              intervalDowntimeId: activeIntervalDowntimeId,
-              startTime: downtimeStartTime,
-              productionMetricsId: pm.id,
-            },
-            create: {
-              workCenterId: wc.id,
-              downtimeId: activeDowntimeId,
-              intervalDowntimeId: activeIntervalDowntimeId,
-              startTime: downtimeStartTime,
-              productionMetricsId: pm.id,
-            },
-          });
-        }
       } else {
         await tx.downtimeState.deleteMany({
           where: { workCenterId: wc.id },
         });
       }
 
-      // 4.8 Atualiza o ponteiro de processamento do InfluxDB (ProcessedState)
+      // 12. Atualiza ProcessedState
       if (latestProcessedPointTimestampMs > 0) {
         await tx.processedState.upsert({
           where: { workCenterId: wc.id },
-          update: {
-            lastProcessed: new Date(latestProcessedPointTimestampMs),
-          },
+          update: { lastProcessed: new Date(latestProcessedPointTimestampMs) },
           create: {
             workCenterId: wc.id,
             lastProcessed: new Date(latestProcessedPointTimestampMs),
@@ -599,6 +1067,8 @@ export async function processTenantWorkCenters(
       }
     });
 
-    logger.debug(`💾 [MES Engine] Linha "${wc.name}" persistida com sucesso.`);
+    logger.debug(
+      `💾 [MES Engine] Linha "${wc.name}" sincronizada com corte estrito de turnos e MetricState.`,
+    );
   }
 }

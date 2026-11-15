@@ -12,35 +12,41 @@ const queryApi = influx.getQueryApi(org);
 export interface TelemetryFeedPoint {
   timestampSeconds: number; // 10 dígitos Unix
   timestampMs: number; // 13 dígitos
-  value: number; // Contagem bruta do canal
+  channel: string; // Ex: "chd1_value", "chd2_value"
+  value: number; // Contagem bruta
 }
 
 interface InfluxRowRecord {
   _value: number | string | boolean;
   _time: string;
+  channel: string;
   [key: string]: unknown;
 }
 
 export async function fetchPointsAfterDirect(params: {
   bucket: string;
   deviceId: string;
-  channel: string;
+  channels: string[]; // Busca produção e refugo juntos
   afterTimestampSeconds: number;
   limit: number;
 }): Promise<TelemetryFeedPoint[]> {
-  const { bucket, deviceId, channel, afterTimestampSeconds, limit } = params;
+  const { bucket, deviceId, channels, afterTimestampSeconds, limit } = params;
 
-  // Janela inicial de busca baseada no último timestamp processado
+  if (channels.length === 0) return [];
+
   const startIso =
     afterTimestampSeconds > 0
       ? new Date(afterTimestampSeconds * 1000).toISOString()
       : new Date(Date.now() - 24 * 3600 * 1000).toISOString();
 
-  // Consulta Flux direta e ordenada pelo tempo
+  // Constrói filtro OR para os canais (ex: r.channel == "chd1_value" or r.channel == "chd2_value")
+  const channelFilter = channels.map((c) => `r.channel == "${c}"`).join(' or ');
+
   const fluxQuery = `
     from(bucket: "${bucket}")
       |> range(start: ${startIso})
-      |> filter(fn: (r) => r._measurement == "device_telemetry" and r._field == "value" and r.channel == "${channel}" and r.deviceId == "${deviceId}")
+      |> filter(fn: (r) => r._measurement == "device_telemetry" and r._field == "value" and r.deviceId == "${deviceId}")
+      |> filter(fn: (r) => ${channelFilter})
       |> filter(fn: (r) => uint(v: r._time) > uint(v: time(v: "${startIso}")))
       |> sort(columns: ["_time"], desc: false)
       |> limit(n: ${limit})
@@ -58,6 +64,7 @@ export async function fetchPointsAfterDirect(params: {
             points.push({
               timestampSeconds: Math.floor(timeMs / 1000),
               timestampMs: timeMs,
+              channel: String(o.channel),
               value: o._value,
             });
           }
