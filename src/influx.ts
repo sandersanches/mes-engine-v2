@@ -1,3 +1,4 @@
+// mes-engine\src\influx.ts
 import { InfluxDB } from '@influxdata/influxdb-client';
 import { logger } from './logger.js';
 
@@ -12,8 +13,8 @@ const queryApi = influx.getQueryApi(org);
 export interface TelemetryFeedPoint {
   timestampSeconds: number; // 10 dígitos Unix
   timestampMs: number; // 13 dígitos
-  channel: string; // Ex: "chd1_value", "chd2_value"
-  value: number; // Contagem bruta
+  channel: string; // Ex: "chd1_value", "ch1_user_range"
+  value: number; // Valor lido
 }
 
 interface InfluxRowRecord {
@@ -26,7 +27,7 @@ interface InfluxRowRecord {
 export async function fetchPointsAfterDirect(params: {
   bucket: string;
   deviceId: string;
-  channels: string[]; // Busca produção e refugo juntos
+  channels: string[];
   afterTimestampSeconds: number;
   limit: number;
 }): Promise<TelemetryFeedPoint[]> {
@@ -39,7 +40,6 @@ export async function fetchPointsAfterDirect(params: {
       ? new Date(afterTimestampSeconds * 1000).toISOString()
       : new Date(Date.now() - 24 * 3600 * 1000).toISOString();
 
-  // Constrói filtro OR para os canais (ex: r.channel == "chd1_value" or r.channel == "chd2_value")
   const channelFilter = channels.map((c) => `r.channel == "${c}"`).join(' or ');
 
   const fluxQuery = `
@@ -83,6 +83,88 @@ export async function fetchPointsAfterDirect(params: {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error(
       `[InfluxDirect] Erro na query Flux para dispositivo "${deviceId}":`,
+      msg,
+    );
+    return [];
+  }
+}
+
+/**
+ * Busca pontos cronológicos (mais antigos -> mais recentes) para variáveis de processo
+ * do Nexus Guardian a partir do timestamp exato (em ms) da última leitura processada.
+ */
+export async function fetchProcessVariablePointsAfter(params: {
+  bucket: string;
+  deviceId: string;
+  channel: string;
+  measurement?: string;
+  field?: string;
+  afterTimestampMs: number;
+  limit: number;
+}): Promise<TelemetryFeedPoint[]> {
+  const {
+    bucket,
+    deviceId,
+    channel,
+    measurement = 'device_telemetry',
+    field = 'value',
+    afterTimestampMs,
+    limit,
+  } = params;
+
+  const startIso =
+    afterTimestampMs > 0
+      ? new Date(afterTimestampMs).toISOString()
+      : new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+  const fluxQuery = `
+    from(bucket: "${bucket}")
+      |> range(start: ${startIso})
+      |> filter(fn: (r) => r._measurement == "${measurement}" and r._field == "${field}" and r.deviceId == "${deviceId}" and r.channel == "${channel}")
+      |> filter(fn: (r) => uint(v: r._time) > uint(v: time(v: "${startIso}")))
+      |> sort(columns: ["_time"], desc: false)
+      |> limit(n: ${limit})
+  `;
+
+  try {
+    const points: TelemetryFeedPoint[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      queryApi.queryRows(fluxQuery, {
+        next(row, tableMeta) {
+          const o = tableMeta.toObject(row) as InfluxRowRecord;
+          const timeMs = new Date(o._time).getTime();
+
+          let numericVal: number | null = null;
+          if (typeof o._value === 'number' && !Number.isNaN(o._value)) {
+            numericVal = o._value;
+          } else if (typeof o._value === 'boolean') {
+            numericVal = o._value ? 1 : 0;
+          }
+
+          if (numericVal !== null) {
+            points.push({
+              timestampSeconds: Math.floor(timeMs / 1000),
+              timestampMs: timeMs,
+              channel: String(o.channel),
+              value: numericVal,
+            });
+          }
+        },
+        error(err) {
+          reject(err);
+        },
+        complete() {
+          resolve();
+        },
+      });
+    });
+
+    return points;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(
+      `[InfluxGuardian] Erro na query Flux para "${deviceId}" (${channel}):`,
       msg,
     );
     return [];

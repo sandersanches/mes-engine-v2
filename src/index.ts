@@ -1,15 +1,26 @@
+// mes-engine\src\index.ts
+
 import dotenv from 'dotenv';
 import { getActiveTenants } from './cache.js';
 import { processTenantWorkCenters } from './processor.js';
+import { processTenantProcessVariables } from './guardian-processor.js';
 import { logger } from './logger.js';
 
 dotenv.config();
 
+// Configurações do Motor Principal (OEE / Produção / Paradas)
 const LOOP_INTERVAL_MS =
   (Number(process.env.LOOP_INTERVAL_SECONDS) || 10) * 1000;
 const BATCH_LIMIT = Number(process.env.BATCH_POINTS_LIMIT) || 500;
 
+// Configurações do Motor Paralelo (Nexus Guardian - Variáveis de Processo)
+const GUARDIAN_LOOP_INTERVAL_MS =
+  (Number(process.env.GUARDIAN_LOOP_INTERVAL_SECONDS) || 5) * 1000;
+const GUARDIAN_BATCH_LIMIT =
+  Number(process.env.GUARDIAN_BATCH_POINTS_LIMIT) || 300;
+
 let isProcessing = false;
+let isGuardianProcessing = false;
 
 async function executeEngineCycle(): Promise<void> {
   // Trava de concorrência: nunca inicia novo ciclo enquanto o anterior estiver rodando
@@ -45,21 +56,65 @@ async function executeEngineCycle(): Promise<void> {
     isProcessing = false;
     const elapsedMs = Date.now() - cycleStart;
 
-    // Agenda a próxima execução garantindo que respeite o tempo restante
     const nextDelay = Math.max(0, LOOP_INTERVAL_MS - elapsedMs);
     setTimeout(executeEngineCycle, nextDelay);
   }
 }
 
-async function main(): Promise<void> {
-  logger.info('🚀 Inicializando Nexus MES Engine (Worker Autônomo)...');
-  logger.info(
-    `⏱️ Frequência de ciclo configurada: ${LOOP_INTERVAL_MS / 1000}s`,
-  );
-  logger.info(`📦 Limite por lote InfluxDB: ${BATCH_LIMIT} pontos`);
+async function executeGuardianCycle(): Promise<void> {
+  // Trava de concorrência exclusiva do Guardian: não bloqueia nem é bloqueada pelo motor MES
+  if (isGuardianProcessing) {
+    logger.warn(
+      '⚠️ [Guardian Engine] Ciclo anterior ainda em execução. Aguardando finalização...',
+    );
+    return;
+  }
 
-  // Inicia o primeiro ciclo imediatamente
+  isGuardianProcessing = true;
+  const cycleStart = Date.now();
+
+  try {
+    const tenants = await getActiveTenants();
+
+    for (const tenant of tenants) {
+      try {
+        await processTenantProcessVariables(tenant, GUARDIAN_BATCH_LIMIT);
+      } catch (tenantErr: unknown) {
+        const errorMsg =
+          tenantErr instanceof Error ? tenantErr.message : String(tenantErr);
+        logger.error(
+          `❌ [Guardian Engine] Erro ao processar variáveis do tenant "${tenant.subdomain}":`,
+          errorMsg,
+        );
+      }
+    }
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error(
+      '❌ [Guardian Engine] Erro fatal no ciclo do motor Guardian:',
+      errorMsg,
+    );
+  } finally {
+    isGuardianProcessing = false;
+    const elapsedMs = Date.now() - cycleStart;
+
+    const nextDelay = Math.max(0, GUARDIAN_LOOP_INTERVAL_MS - elapsedMs);
+    setTimeout(executeGuardianCycle, nextDelay);
+  }
+}
+
+async function main(): Promise<void> {
+  logger.info('🚀 Inicializando Nexus MES Engine (Workers Autônomos)...');
+  logger.info(
+    `⏱️ [MES] Ciclo: ${LOOP_INTERVAL_MS / 1000}s | Lote máx: ${BATCH_LIMIT} pts`,
+  );
+  logger.info(
+    `🛡️ [Guardian] Ciclo: ${GUARDIAN_LOOP_INTERVAL_MS / 1000}s | Lote máx: ${GUARDIAN_BATCH_LIMIT} pts`,
+  );
+
+  // Inicia os dois motores em paralelo de forma totalmente independente
   void executeEngineCycle();
+  void executeGuardianCycle();
 }
 
 void main();

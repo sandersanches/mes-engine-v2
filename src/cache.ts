@@ -1,3 +1,4 @@
+// mes-engine\src\cache.ts
 import { controlPlaneDb, getTenantClient } from './db.js';
 import { logger } from './logger.js';
 
@@ -15,6 +16,7 @@ export interface CachedTenant {
   subdomain: string;
   influxBucket: string;
   stopToleranceSeconds: number;
+  activeModules: string[];
 }
 
 interface TenantShiftsCache {
@@ -53,6 +55,10 @@ export async function getActiveTenants(): Promise<CachedTenant[]> {
         subdomain: true,
         influxBucket: true,
         stopToleranceSeconds: true,
+        modules: {
+          where: { isActive: true },
+          select: { module: true },
+        },
       },
     });
 
@@ -63,6 +69,9 @@ export async function getActiveTenants(): Promise<CachedTenant[]> {
       influxBucket:
         t.influxBucket || `mes_bucket_${t.subdomain.replace(/-/g, '_')}`,
       stopToleranceSeconds: t.stopToleranceSeconds || 30,
+      activeModules: Array.isArray(t.modules)
+        ? t.modules.map((m: { module: string }) => m.module)
+        : [],
     }));
 
     tenantsCache = {
