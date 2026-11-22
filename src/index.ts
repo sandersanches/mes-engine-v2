@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { getActiveTenants } from './cache.js';
 import { processTenantWorkCenters } from './processor.js';
 import { processTenantProcessVariables } from './guardian-processor.js';
+import { processTenantScheduledTasks } from './paperless-scheduler.js';
 import { logger } from './logger.js';
 
 dotenv.config();
@@ -13,14 +14,19 @@ const LOOP_INTERVAL_MS =
   (Number(process.env.LOOP_INTERVAL_SECONDS) || 10) * 1000;
 const BATCH_LIMIT = Number(process.env.BATCH_POINTS_LIMIT) || 500;
 
-// Configurações do Motor Paralelo (Nexus Guardian - Variáveis de Processo)
+// Configurações do Motor Paralelo 1 (Nexus Guardian - Variáveis de Processo)
 const GUARDIAN_LOOP_INTERVAL_MS =
   (Number(process.env.GUARDIAN_LOOP_INTERVAL_SECONDS) || 5) * 1000;
 const GUARDIAN_BATCH_LIMIT =
   Number(process.env.GUARDIAN_BATCH_POINTS_LIMIT) || 300;
 
+// Configurações do Motor Paralelo 2 (Paperless & CEP - Agendamentos e Pendências)
+const PAPERLESS_LOOP_INTERVAL_MS =
+  (Number(process.env.PAPERLESS_LOOP_INTERVAL_SECONDS) || 30) * 1000;
+
 let isProcessing = false;
 let isGuardianProcessing = false;
+let isSchedulerProcessing = false;
 
 async function executeEngineCycle(): Promise<void> {
   // Trava de concorrência: nunca inicia novo ciclo enquanto o anterior estiver rodando
@@ -103,6 +109,48 @@ async function executeGuardianCycle(): Promise<void> {
   }
 }
 
+async function executePaperlessSchedulerCycle(): Promise<void> {
+  // Trava de concorrência exclusiva do Agendador Paperless/CEP
+  if (isSchedulerProcessing) {
+    logger.warn(
+      '⚠️ [Paperless Scheduler] Ciclo anterior ainda em execução. Aguardando finalização...',
+    );
+    return;
+  }
+
+  isSchedulerProcessing = true;
+  const cycleStart = Date.now();
+
+  try {
+    const tenants = await getActiveTenants();
+
+    for (const tenant of tenants) {
+      try {
+        await processTenantScheduledTasks(tenant);
+      } catch (tenantErr: unknown) {
+        const errorMsg =
+          tenantErr instanceof Error ? tenantErr.message : String(tenantErr);
+        logger.error(
+          `❌ [Paperless Scheduler] Erro ao processar agendamentos do tenant "${tenant.subdomain}":`,
+          errorMsg,
+        );
+      }
+    }
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error(
+      '❌ [Paperless Scheduler] Erro fatal no ciclo do agendador:',
+      errorMsg,
+    );
+  } finally {
+    isSchedulerProcessing = false;
+    const elapsedMs = Date.now() - cycleStart;
+
+    const nextDelay = Math.max(0, PAPERLESS_LOOP_INTERVAL_MS - elapsedMs);
+    setTimeout(executePaperlessSchedulerCycle, nextDelay);
+  }
+}
+
 async function main(): Promise<void> {
   logger.info('🚀 Inicializando Nexus MES Engine (Workers Autônomos)...');
   logger.info(
@@ -111,10 +159,14 @@ async function main(): Promise<void> {
   logger.info(
     `🛡️ [Guardian] Ciclo: ${GUARDIAN_LOOP_INTERVAL_MS / 1000}s | Lote máx: ${GUARDIAN_BATCH_LIMIT} pts`,
   );
+  logger.info(
+    `📋 [Paperless/CEP] Ciclo de Agendamentos: ${PAPERLESS_LOOP_INTERVAL_MS / 1000}s`,
+  );
 
-  // Inicia os dois motores em paralelo de forma totalmente independente
+  // Inicia os três motores em paralelo de forma totalmente independente
   void executeEngineCycle();
   void executeGuardianCycle();
+  void executePaperlessSchedulerCycle();
 }
 
 void main();
